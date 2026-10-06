@@ -1,0 +1,773 @@
+---
+title: "Exploring planktonic communities in the Tara Ocean \n\n Practical Session"
+author: "Pedro C. Junger"
+date: "2026-10-06"
+subtitle: "Community Ecology"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+# 1. From ocean samples to ecological communities
+
+Community ecology asks how biological communities are structured, how their diversity varies among environments, and how community composition changes across space and environmental gradients.
+
+Here we will use an 18S V4 metabarcoding dataset from the *Tara Oceans* expedition as a real example of a large community dataset. OTUs represent different eukaryotic plankton lineages, while samples span different ocean regions, depths and plankton size fractions.
+
+We will start from preprocessed tables so that most of the practical can be spent interpreting ecological patterns rather than waiting for large datasets to be processed. The full preprocessing workflow is available in the `extra_codes/` folder.
+
+# 2. Load the data
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(vegan)
+library(ape)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 7,
+  fig.height = 4.5
+)
+```
+
+The community table contains protist OTUs in rows and *Tara Oceans* samples in columns. The table contains relative abundances, and OTUs representing less than 0.1% of a sample were set to zero to make the beta-diversity analyses faster.
+
+The original workflow used to remove unclassified sequences, Opisthokonta and Rhodophyta and to create this table is available in `extra_codes/02_prepare_protist_community.R`.
+
+```{r load-community-data}
+# Protist community table
+otus_ra <- read.csv2(
+  "outputs/tables/OTUtab_protists_ra_filtered.csv",
+  dec = ".",
+  header = TRUE,
+  check.names = FALSE
+)
+
+# Environmental/contextual data + alpha-diversity metrics
+env_div <- read.csv2(
+  "outputs/tables/context-env-div_otu-ra_tab.csv",
+  dec = ".",
+  header = TRUE
+)
+
+# Identify sample columns
+samples_list <- grep(
+  "^TARA_",
+  colnames(otus_ra),
+  value = TRUE
+)
+
+# Inspect the tables
+dim(otus_ra)
+length(samples_list)
+otus_ra[1:5, 1:10]
+env_div[1:5, ]
+```
+
+**Questions**
+
+- What do the rows and columns of the community table represent?
+- How many OTUs and samples are present?
+- Which variable connects the community data with the contextual data?
+
+We will also clean and reorder a few metadata variables:
+
+```{r clean-metadata}
+env_div <- env_div %>%
+  filter(
+    !is.na(depthplot),
+    !depthplot %in% c("", "ZZZ", "FSW")
+  ) %>%
+  mutate(
+    ocean_region = gsub(
+      "^\\[.*?\\]\\s*(.*?)\\s*\\(MRGID:.*\\)",
+      "\\1",
+      ocean_region
+    ),
+    depthplot = fct_relevel(
+      depthplot,
+      "SRF",
+      "MIX/DCM",
+      "MES"
+    ),
+    sizeplot = fct_relevel(
+      sizeplot,
+      "meso",
+      "micro",
+      "nano",
+      "piconano",
+      "pico"
+    )
+  )
+```
+
+# 3. Sampling effort and rarefaction
+
+The probability of detecting taxa depends partly on sampling effort. In metabarcoding data, samples with more sequencing reads have more opportunities to detect rare OTUs.
+
+A **rarefaction curve** shows how observed richness increases as the number of sampled reads increases. Curves approaching a plateau indicate that additional sampling is detecting progressively fewer new OTUs.
+
+Generating the curves for all *Tara Oceans* samples is relatively slow, so the rarefaction table has already been calculated. The complete code used to generate it is available in `extra_codes/03_compute_rarefaction_curves.R`.
+
+```{r rarefaction}
+table_raref <- read.csv2(
+  "outputs/tables/tab_raref_curves.csv",
+  header = TRUE
+)
+
+table_raref$number_reads <- as.numeric(
+  table_raref$number_reads
+)
+
+table_raref$OTU_richness <- as.numeric(
+  table_raref$OTU_richness
+)
+
+ggplot(
+  table_raref,
+  aes(
+    x = number_reads,
+    y = OTU_richness,
+    group = sample
+  )
+) +
+  geom_line(
+    alpha = 0.35,
+    linewidth = 0.4
+  ) +
+  theme_classic() +
+  labs(
+    x = "Number of reads",
+    y = "OTU richness"
+  )
+```
+
+**Discuss**
+
+- Do all samples have the same sequencing depth?
+- Do most curves approach a plateau?
+- Why can unequal sampling effort be problematic when comparing richness among communities?
+- What could we do to account for differences in sequencing effort?
+
+For the beta-diversity analyses below, we use **relative abundances**, so each sample sums to 1. Rarefaction is therefore used here primarily to examine sampling completeness rather than as the normalization method for the community matrix.
+
+# 4. Alpha diversity
+
+**Alpha diversity** describes diversity within a community.
+
+We will consider four commonly used metrics:
+
+- **OTU richness**: number of OTUs detected;
+- **Shannon diversity**: incorporates richness and relative abundance;
+- **Inverse Simpson**: gives relatively more weight to abundant OTUs;
+- **Pielou evenness**: describes how evenly abundance is distributed among OTUs.
+
+These metrics were calculated from the complete protist community before applying the 0.1% abundance filter. The calculation is shown in `extra_codes/04_compute_alpha_diversity.R`.
+
+## 4.1. Alpha diversity among size fractions
+
+```{r alpha-size}
+ggplot(
+  env_div,
+  aes(
+    x = sizeplot,
+    y = Shannon,
+    fill = sizeplot
+  )
+) +
+  geom_boxplot(
+    alpha = 0.7,
+    outlier.shape = NA
+  ) +
+  geom_jitter(
+    width = 0.15,
+    alpha = 0.35,
+    size = 0.8
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "none"
+  ) +
+  labs(
+    x = "Size fraction",
+    y = "Shannon diversity"
+  )
+```
+
+**Questions**
+
+- Which size fractions appear to have the highest alpha diversity?
+- Does variability within size fractions differ?
+
+We can test whether mean Shannon diversity differs among size fractions:
+
+```{r alpha-anova}
+anova_size <- aov(
+  Shannon ~ sizeplot,
+  data = env_div
+)
+
+summary(anova_size)
+
+TukeyHSD(
+  anova_size,
+  conf.level = 0.95
+)
+```
+
+**Questions**
+
+- Is the overall effect of size fraction statistically significant?
+- What additional information does the Tukey test provide?
+
+## 4.2. Alpha diversity along an environmental gradient
+
+To reduce variation associated with organism size, we will focus on the **piconano** fraction.
+
+```{r alpha-temperature}
+env_div_piconano <- env_div %>%
+  filter(sizeplot == "piconano")
+
+ggplot(
+  env_div_piconano,
+  aes(
+    x = temperature,
+    y = Shannon
+  )
+) +
+  geom_point(alpha = 0.55) +
+  geom_smooth(
+    method = "lm",
+    se = TRUE
+  ) +
+  theme_bw() +
+  labs(
+    x = "Temperature (°C)",
+    y = "Shannon diversity"
+  )
+
+model_temperature <- lm(
+  Shannon ~ temperature,
+  data = env_div_piconano
+)
+
+summary(model_temperature)
+```
+
+**Questions**
+
+- Is Shannon diversity related to temperature?
+- What does the slope of the linear model indicate?
+- Does a statistically significant relationship necessarily imply a strong ecological effect?
+
+# 5. Beta diversity
+
+Alpha diversity describes diversity **within** samples. **Beta diversity** describes differences in community composition **among** samples.
+
+Here we will use **Bray-Curtis dissimilarity**, an abundance-based measure ranging from 0 for communities with identical composition to 1 for communities sharing no abundance.
+
+Again, we will focus on the piconano fraction.
+
+## 5.1. Prepare the community matrix
+
+The `vegan` package expects samples in rows and OTUs in columns, so we transpose our community table.
+
+```{r beta-prepare}
+meta_beta <- env_div %>%
+  filter(
+    sizeplot == "piconano",
+    sample_id_pangaea %in% samples_list
+  ) %>%
+  arrange(sample_id_pangaea) %>%
+  droplevels()
+
+beta_samples <- meta_beta$sample_id_pangaea
+
+comm_beta <- t(
+  as.matrix(
+    otus_ra[
+      ,
+      beta_samples,
+      drop = FALSE
+    ]
+  )
+)
+
+storage.mode(comm_beta) <- "numeric"
+
+# Community matrix and metadata must have identical sample order
+identical(
+  rownames(comm_beta),
+  meta_beta$sample_id_pangaea
+)
+
+dim(comm_beta)
+```
+
+## 5.2. Bray-Curtis dissimilarity
+
+```{r bray-curtis}
+dist_bray <- vegdist(
+  comm_beta,
+  method = "bray"
+)
+
+dist_bray
+```
+
+The resulting distance matrix contains the pairwise dissimilarity between all communities.
+
+**Question**
+
+What information is contained in a single value of this matrix?
+
+## 5.3. Principal Coordinates Analysis (PCoA)
+
+A distance matrix contains many pairwise comparisons and is difficult to inspect directly. **Principal Coordinates Analysis (PCoA)** projects these multivariate dissimilarities onto a small number of axes.
+
+Samples that plot close together have more similar community composition than samples that plot far apart.
+
+```{r pcoa}
+res_pcoa <- pcoa(
+  dist_bray,
+  correction = "none"
+)
+
+pcoa_data <- data.frame(
+  sample_id_pangaea = rownames(
+    res_pcoa$vectors
+  ),
+  Axis1 = res_pcoa$vectors[, 1],
+  Axis2 = res_pcoa$vectors[, 2]
+) %>%
+  left_join(
+    meta_beta %>%
+      select(
+        sample_id_pangaea,
+        ocean_region,
+        depthplot
+      ),
+    by = "sample_id_pangaea"
+  )
+
+axis1_var <- round(
+  res_pcoa$values$Relative_eig[1] * 100,
+  1
+)
+
+axis2_var <- round(
+  res_pcoa$values$Relative_eig[2] * 100,
+  1
+)
+
+ggplot(
+  pcoa_data,
+  aes(
+    x = Axis1,
+    y = Axis2,
+    color = ocean_region,
+    shape = depthplot
+  )
+) +
+  geom_point(
+    alpha = 0.75,
+    size = 2.3
+  ) +
+  theme_bw() +
+  labs(
+    x = paste0(
+      "PCoA1 (",
+      axis1_var,
+      "%)"
+    ),
+    y = paste0(
+      "PCoA2 (",
+      axis2_var,
+      "%)"
+    ),
+    color = "Ocean region",
+    shape = "Depth"
+  )
+```
+
+**Discuss**
+
+- Do samples from the same ocean region tend to cluster together?
+- Is there visible separation among depth layers?
+- What percentage of the total variation is represented by the first two axes?
+- Why should we be cautious about interpreting visual separation alone?
+
+# 6. Testing differences in community composition
+
+Two complementary analyses help us interpret the patterns seen in the PCoA:
+
+- **PERMANOVA** tests whether groups differ in their multivariate centroids;
+- **beta dispersion** tests whether groups differ in their within-group variability.
+
+Checking dispersion is important because differences in dispersion can affect the interpretation of a PERMANOVA result.
+
+## 6.1. Beta dispersion
+
+```{r beta-dispersion}
+disp_ocean <- betadisper(
+  dist_bray,
+  meta_beta$ocean_region
+)
+
+permutest(
+  disp_ocean,
+  permutations = 999
+)
+
+disp_depth <- betadisper(
+  dist_bray,
+  meta_beta$depthplot
+)
+
+permutest(
+  disp_depth,
+  permutations = 999
+)
+```
+
+**Question**
+
+Is multivariate dispersion significantly different among ocean regions or depth layers?
+
+## 6.2. PERMANOVA
+
+```{r permanova}
+permanova <- adonis2(
+  dist_bray ~ ocean_region + depthplot,
+  data = meta_beta,
+  permutations = 999,
+  by = "margin"
+)
+
+permanova
+```
+
+**Discuss**
+
+- Does community composition differ significantly among ocean regions?
+- Does it differ among depth layers?
+- Which factor explains more variation? Compare the \(R^2\) values.
+- How should the beta-dispersion results affect your interpretation of the PERMANOVA?
+
+# 7. What should you take away?
+
+At this point you should be able to distinguish:
+
+1. **sampling completeness** from biological diversity;
+2. **alpha diversity** from **beta diversity**;
+3. a **dissimilarity matrix** from an **ordination**;
+4. visual differences in a PCoA from a statistical test of community composition;
+5. differences in group **centroids** from differences in group **dispersion**.
+
+# 8. Extension — Choose your favourite plankton! {.tabset}
+
+**If time allows:** work in small groups and choose one plankton group. The objective is to reproduce some of the analyses above using only that taxonomic group.
+
+If you do not reach this section during the practical, you can use it later as an independent exercise.
+
+Possible groups include **Diatomeae, Mamiellophyceae, Dinophyceae, Haptophyta, Pelagophyceae, Picozoa, Radiolaria, MALV, MAST, Ciliophora** or **Metazoa**.
+
+## 8.1. Download and load the original data
+
+This extension needs the original OTU and taxonomy tables. The following command downloads them automatically if they are not already available.
+
+```{r favourite-load, eval=FALSE}
+source(
+  "extra_codes/01_download_tara_data.R"
+)
+
+otus <- readr::read_tsv(
+  "datasets/TARA-Oceans_18S-V4_Swarm-Mumu_table.tsv.gz",
+  show_col_types = FALSE
+)
+
+taxo <- readr::read_tsv(
+  "datasets/TARA-Oceans_18S-V4_Swarm-Mumu_taxo.tsv.gz",
+  show_col_types = FALSE
+)
+
+context <- readr::read_tsv(
+  "datasets/context_general.tsv",
+  show_col_types = FALSE
+)
+
+env <- readr::read_tsv(
+  "datasets/context_stat.tsv",
+  show_col_types = FALSE
+)
+```
+
+## 8.2. Select your group
+
+Change only `fav_group` below.
+
+```{r favourite-select, eval=FALSE}
+fav_group <- "Diatomeae"
+
+fav_tax <- taxo %>%
+  filter(
+    str_detect(
+      closest_hits_lca,
+      regex(
+        fav_group,
+        ignore_case = TRUE
+      )
+    )
+  )
+
+fav_otus <- otus %>%
+  filter(
+    amplicon %in% fav_tax$amplicon
+  )
+
+# For comparison with all classified eukaryotic OTUs
+classified_tax <- taxo %>%
+  filter(
+    !str_detect(
+      closest_hits_lca,
+      "No_hit"
+    )
+  )
+
+nrow(fav_tax)
+
+nrow(fav_tax) /
+  nrow(classified_tax) * 100
+
+sum(fav_tax$abundance)
+
+sum(fav_tax$abundance) /
+  sum(classified_tax$abundance) * 100
+```
+
+**Questions**
+
+- How many OTUs belong to your group?
+- What percentage of classified OTUs and reads do they represent?
+- In which size fraction would you expect this group to be most important?
+
+## 8.3. Calculate alpha diversity for your group
+
+```{r favourite-alpha, eval=FALSE}
+fav_samples <- grep(
+  "^TARA_",
+  colnames(fav_otus),
+  value = TRUE
+)
+
+fav_counts <- as.matrix(
+  fav_otus[, fav_samples]
+)
+storage.mode(fav_counts) <- "numeric"
+
+# Remove samples where the group was not detected
+fav_counts <- fav_counts[
+  ,
+  colSums(fav_counts) > 0,
+  drop = FALSE
+]
+
+fav_comm <- t(fav_counts)
+
+fav_alpha <- data.frame(
+  sample_id_pangaea = rownames(fav_comm),
+  OTU_richness = specnumber(fav_comm),
+  Shannon = diversity(
+    fav_comm,
+    index = "shannon"
+  )
+)
+
+context_env <- merge(
+  context,
+  env,
+  by = "sample_id_pangaea"
+)
+
+fav_env <- merge(
+  context_env,
+  fav_alpha,
+  by = "sample_id_pangaea"
+) %>%
+  filter(
+    !is.na(depthplot),
+    !depthplot %in% c("", "ZZZ", "FSW")
+  ) %>%
+  mutate(
+    ocean_region = gsub(
+      "^\\[.*?\\]\\s*(.*?)\\s*\\(MRGID:.*\\)",
+      "\\1",
+      ocean_region
+    )
+  )
+
+ggplot(
+  fav_env,
+  aes(
+    x = sizeplot,
+    y = Shannon,
+    fill = sizeplot
+  )
+) +
+  geom_boxplot(
+    outlier.shape = NA
+  ) +
+  geom_jitter(
+    width = 0.15,
+    alpha = 0.4,
+    size = 0.8
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "none"
+  ) +
+  labs(
+    title = fav_group,
+    x = "Size fraction",
+    y = "Shannon diversity"
+  )
+```
+
+**Discuss**
+
+How does the alpha-diversity pattern of your group compare with the pattern observed for the complete protist community?
+
+## 8.4. Repeat the beta-diversity analysis
+
+First inspect how many samples are available in each size fraction:
+
+```{r favourite-fraction, eval=FALSE}
+table(
+  fav_env$sizeplot
+)
+```
+
+Choose a size fraction with enough samples and replace `"micro"` below if necessary.
+
+```{r favourite-beta, eval=FALSE}
+fav_fraction <- "micro"
+
+fav_meta_beta <- fav_env %>%
+  filter(
+    sizeplot == fav_fraction,
+    sample_id_pangaea %in% rownames(fav_comm)
+  ) %>%
+  arrange(sample_id_pangaea) %>%
+  droplevels()
+
+fav_beta_samples <- fav_meta_beta$sample_id_pangaea
+
+# Convert to relative abundance within the selected plankton group
+fav_comm_beta <- fav_comm[
+  fav_beta_samples,
+  ,
+  drop = FALSE
+]
+
+fav_comm_beta <- sweep(
+  fav_comm_beta,
+  MARGIN = 1,
+  STATS = rowSums(fav_comm_beta),
+  FUN = "/"
+)
+
+fav_dist <- vegdist(
+  fav_comm_beta,
+  method = "bray"
+)
+
+fav_pcoa <- pcoa(
+  fav_dist,
+  correction = "none"
+)
+
+fav_pcoa_data <- data.frame(
+  sample_id_pangaea = rownames(
+    fav_pcoa$vectors
+  ),
+  Axis1 = fav_pcoa$vectors[, 1],
+  Axis2 = fav_pcoa$vectors[, 2]
+) %>%
+  left_join(
+    fav_meta_beta %>%
+      select(
+        sample_id_pangaea,
+        ocean_region,
+        depthplot
+      ),
+    by = "sample_id_pangaea"
+  )
+
+ggplot(
+  fav_pcoa_data,
+  aes(
+    x = Axis1,
+    y = Axis2,
+    color = ocean_region,
+    shape = depthplot
+  )
+) +
+  geom_point(
+    alpha = 0.75,
+    size = 2.3
+  ) +
+  theme_bw() +
+  labs(
+    title = paste(
+      fav_group,
+      "-",
+      fav_fraction
+    ),
+    color = "Ocean region",
+    shape = "Depth"
+  )
+```
+
+Finally, repeat the statistical tests:
+
+```{r favourite-tests, eval=FALSE}
+# Beta dispersion
+fav_disp_ocean <- betadisper(
+  fav_dist,
+  fav_meta_beta$ocean_region
+)
+
+permutest(
+  fav_disp_ocean,
+  permutations = 999
+)
+
+fav_disp_depth <- betadisper(
+  fav_dist,
+  fav_meta_beta$depthplot
+)
+
+permutest(
+  fav_disp_depth,
+  permutations = 999
+)
+
+# PERMANOVA
+adonis2(
+  fav_dist ~ ocean_region + depthplot,
+  data = fav_meta_beta,
+  permutations = 999,
+  by = "margin"
+)
+```
+
+**Group challenge**
+
+Compare your results with another group:
+
+- Does the same environmental structure emerge for different plankton groups?
+- Is ocean region or depth more important for your group?
+- Are differences in composition accompanied by differences in dispersion?
